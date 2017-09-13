@@ -1,0 +1,159 @@
+#!/usr/bin/env ruby
+
+require 'aws-sdk'
+require 'optparse'
+
+def split_on_first(str, splitter)
+  split_position = str.index splitter
+  [str[0, split_position], str[split_position + 1, str.length - 1]]
+end
+
+class Parser
+  ATTRIBUTES = [:application, :environment, :file, :profile, :region].freeze
+  Options = Struct.new(*ATTRIBUTES) do
+    def missing_args
+      ATTRIBUTES.select { |attr| self[attr].nil? }
+    end
+
+    def valid?
+      missing_args.empty?
+    end
+  end
+
+  def self.parse(options)
+    Options.new.tap do |parsed|
+      parser(parsed).parse!(options)
+      raise(
+        OptionParser::MissingArgument, parsed.missing_args
+      ) unless parsed.valid?
+    end
+  end
+
+  def self.add_option(name, opts, args, doc)
+    opts.on("-#{name[0]}", "--#{name} [#{name.upcase}]", doc) do |option_value|
+      args.send("#{name}=", option_value)
+    end
+  end
+
+  def self.parser(parsed)
+    OptionParser.new do |opts|
+      opts.banner = <<-EOF
+      Manage environment variables for AWS ElasticBeanstalk
+      Usage: update-beanstalk-env [options]
+      EOF
+
+      add_option('application', opts, parsed, 'ElasticBeanstalk Application')
+      add_option('environment', opts, parsed, 'ElasticBeanstalk Environment')
+      add_option('file', opts, parsed, 'Env vars file to set in dotenv format')
+      add_option('profile', opts, parsed, 'Shared Credentials Profile')
+      add_option('region', opts, parsed, 'AWS Region')
+
+      opts.on_tail('-h', '--help', 'Show this message') do
+        puts opts
+        exit
+      end
+    end
+  end
+end
+
+class BeanstalkEnvironmentUpdater
+  ENVIRONMENT_NAMESPACE = 'aws:elasticbeanstalk:application:environment'.freeze
+
+  attr_accessor :application, :environment, :profile, :region
+
+  def initialize(args = {})
+    args.each { |k, v| send("#{k}=", v) }
+  end
+
+  def update_environment(new_variables)
+    keys_to_remove = keys_to_remove(new_variables)
+    keys_to_update = keys_to_update(new_variables, keys_to_remove)
+
+    wait_for_ready
+
+    client.update_environment(
+      application_name: application,
+      environment_name: environment,
+      option_settings: keys_to_update,
+      options_to_remove: keys_to_remove
+    )
+
+    wait_for_ready
+  end
+
+  protected
+
+  def wait_for_ready
+    loop do
+      environment = client.describe_environments(
+        application_name: application,
+        environment_names: environment
+      ).dig(:environments).first
+
+      break if environment[:status] == 'Ready'
+
+      sleep 5
+    end
+  end
+
+  def keys_to_remove(new_variables)
+    (environment_variables.keys - new_variables.keys)
+      .map { |key| { namespace: ENVIRONMENT_NAMESPACE, option_name: key } }
+  end
+
+  def keys_to_update(new_variables, keys_to_remove)
+    new_variables
+      .reject { |key, _| keys_to_remove.include?(key) }
+      .map do |key, value|
+      {
+        namespace: ENVIRONMENT_NAMESPACE,
+        option_name: key,
+        value: value
+      }
+    end
+  end
+
+  def environment_variables
+    response = client.describe_configuration_settings(
+      application_name: application, environment_name: environment
+    )
+
+    response
+      .dig(:configuration_settings, 0, :option_settings)
+      .select { |opt| opt[:namespace] == ENVIRONMENT_NAMESPACE }
+      .map { |setting| [setting[:option_name], setting[:value]] }
+      .to_h
+  end
+
+  def client
+    @client ||= Aws::ElasticBeanstalk::Client.new(
+      credentials: Aws::SharedCredentials.new(profile_name: profile),
+      region: region
+    )
+  end
+end
+
+class Main
+  def self.run
+    options = Parser.parse(ARGV)
+
+    new_variables =
+      (options.file == '-' ? STDIN : open(options.file))
+      .each_line
+      .lazy
+      .map(&:chomp)
+      .map(&:strip)
+      .reject(&:empty?)
+      .map { |l| split_on_first(l, '=') }
+      .to_h
+
+    BeanstalkEnvironmentUpdater.new(
+      application: options.application,
+      environment: options.environment,
+      profile: options.profile,
+      region: options.region
+    ).update_environment(new_variables)
+  end
+end
+
+Main.run
